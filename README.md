@@ -144,3 +144,86 @@ O código python que usaremos nesse projeto se encontra [nesse arquivo](./cloud_
     <img src="./images/cf.png">
 
 ### Criando as páginas, fluxos e rotas
+A página inicial terá um mensagens de boas vindas, e dando a possibilidade ao usuário de responder se ele gostaria de avaliar algum produto ou não.
+- Se o usuário responder com um "yes", será direcionado para o fluxo "Product Review"
+- Se o usuário responder com um "no", será direcionado para o fim da sessão
+
+O fluxo Product review tem 4 páginas
+- A página inicial que vai capturar o nome do usuário
+- A página de seleção do produto para avaliar
+  - Nessa página, o usuário é obrigado a fornecer o nome do produto, caso o contrário o bot não irá prosseguir
+- A página de avaliacão do produto, onde o usuário vai fazer o review
+  - Nessa página, foi configurado um "No-match 1", para que não haja correspondência com nada que o usuário disser, e automaticamente acione o webhook.
+  - O Webhook irá retornar uma resposta automatica com base no nível de satisfação do usuário
+- A página End Session diz respeito ao fim da conversa
+
+### Explorando o código em python
+```py
+import functions_framework
+from flask import jsonify
+from google.cloud import language_v1
+from google.cloud import bigquery
+from typing import Dict
+
+def natural_language(name, text,product):
+    client = language_v1.LanguageServiceClient()
+    document = language_v1.types.Document(
+      content=text, type_=language_v1.types.Document.Type.PLAIN_TEXT
+    )
+    sentiment = client.analyze_sentiment(request={"document": document}).document_sentiment
+    analyze_iter = iter(["name", name ,"product", product, "text", text, "sentiment_score", f"{sentiment.score:.2f}", "sentiment_magnitude", f"{sentiment.magnitude:.2f}"])
+    analyze: Dict[str, str] = {}
+
+    for analyze_name in analyze_iter:
+        analyze[analyze_name] = next(analyze_iter)
+
+    response_user = ""
+    if float(analyze["sentiment_score"]) < -0.5:
+        response_user = "We're sorry you didn't like it. We'll work to improve."
+    elif float(analyze["sentiment_score"]) >= -0.5 and float(analyze["sentiment_score"]) < 0:
+        response_user = "We're sorry it wasn't a good experience for you. We'll work to improve."
+    elif float(analyze["sentiment_score"]) >= 0 and float(analyze["sentiment_score"]) < 0.6:
+        response_user = "We're glad you enjoyed it! Your feedback is important for us to improve."
+    elif float(analyze["sentiment_score"]) >= 0.6:
+        response_user = "We're happy to hear you had a great experience."
+    
+    return analyze,response_user
+
+def write_data_bq(analyzed_text):
+    client = bigquery.Client()
+    dataset_id = "projeto-estudos-415711.evaluate_product.evaluate"
+    QUERY = f"""
+        INSERT INTO `{dataset_id}` (Name, Product, Text, Score) VALUES ("{analyzed_text["name"]}","{analyzed_text["product"]}","{analyzed_text["text"]}",{analyzed_text["sentiment_score"]})
+    """
+    client.query_and_wait(QUERY)
+
+@functions_framework.http
+def analyze_webhook(request):
+    data = request.get_json()
+
+    print(data)
+
+    tag = data["fulfillmentInfo"]["tag"]
+    text = data["text"]
+    name = data["sessionInfo"]["parameters"]["name"]["name"]
+    product = data["sessionInfo"]["parameters"]["product"]
+
+    analyzed_text, response_user = natural_language(name,text,product)
+    write_data_bq(analyzed_text)
+
+    return jsonify(
+        {
+            'fulfillment_response': {
+                'messages': [
+                    {
+                        'text': {
+                            'text': [response_user]
+                        }
+                    }
+                ]
+            }
+        }
+    )
+```
+
+Esse código em questão vai receber a avaliação do usuário, assim como o seu nome e o nome do produto que ele está avaliando. Após isso, ele vai realizar a análise do texto e retornar um score de -1 a 1, e também uma resposta ao usuário com base nesse score. A função **write_data_bq** vai escrever a avaliação, o nome do usuário, o nome do produto e o score em um dataset dentro do BigQuery. E, por fim, o código vai fornecer um texto de resposta com base na avaliação para o Bot no DialogFlow
